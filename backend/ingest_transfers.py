@@ -1,12 +1,17 @@
-"""Ingestion pipeline for transfer portal players using real CFBD data."""
+"""Ingestion pipeline for transfer portal players using On3 portal data."""
 from __future__ import annotations
 
 from typing import Dict, Iterable, List, Optional
 
-from cfbd_client import get_fbs_teams, get_player_season_stats, get_transfers
+from on3_client import get_on3_transfers
+from cfbd_client import get_fbs_teams, get_player_season_stats  # still used for team metadata + stats
 from supabase_client import get_supabase
 from tvi_engine import compute_tvi
 
+
+# ---------------------------------------------------------
+# TEAM INGESTION (CFBD still works for team metadata)
+# ---------------------------------------------------------
 
 def _normalize_team_payload(team: Dict) -> Dict:
     logos = team.get("logos") or []
@@ -21,6 +26,7 @@ def _normalize_team_payload(team: Dict) -> Dict:
 
 
 def _build_team_index(team_rows: Iterable[Dict]) -> Dict[str, Dict]:
+    """Create lookup by school_id and by name."""
     index: Dict[str, Dict] = {}
     for row in team_rows:
         if row.get("school_id"):
@@ -31,13 +37,22 @@ def _build_team_index(team_rows: Iterable[Dict]) -> Dict[str, Dict]:
 
 
 def _upsert_teams() -> Dict[str, Dict]:
+    """Ensure FBS teams exist in Supabase and build lookup."""
     supabase = get_supabase()
     teams = get_fbs_teams()
     payload = [_normalize_team_payload(team) for team in teams if team]
-    response = supabase.table("teams").upsert(payload, on_conflict="school_id").execute()
+
+    response = supabase.table("teams").upsert(
+        payload, on_conflict="school_id"
+    ).execute()
+
     data = response.data or []
     return _build_team_index(data)
 
+
+# ---------------------------------------------------------
+# SEASON INGESTION
+# ---------------------------------------------------------
 
 def _ensure_season(year: int) -> int:
     supabase = get_supabase()
@@ -48,23 +63,23 @@ def _ensure_season(year: int) -> int:
     )
     if result.data and len(result.data) > 0:
         return int(result.data[0]["id"])
-    season_row = supabase.table("seasons").select("id").eq("year", year).single().execute()
+
+    season_row = (
+        supabase.table("seasons")
+        .select("id")
+        .eq("year", year)
+        .single()
+        .execute()
+    )
     return int(season_row.data["id"])
 
 
-def _find_player_stats(
-    stats: List[Dict], transfer: Dict, player_name: str
-) -> Optional[Dict]:
-    cfbd_player_id = transfer.get("id") or transfer.get("player_id")
-    for stat in stats:
-        if cfbd_player_id is not None and str(stat.get("id")) == str(cfbd_player_id):
-            return stat
-        if stat.get("player") and stat.get("player").strip().lower() == player_name:
-            return stat
-    return None
-
+# ---------------------------------------------------------
+# STATS NORMALIZATION (fallback-only — CFBD stats may not match On3 players)
+# ---------------------------------------------------------
 
 def _normalize_stats(raw: Optional[Dict]) -> Dict:
+    """Fallback stat normalization if CFBD player-season match fails."""
     if not raw:
         return {
             "games_played": 0,
@@ -83,11 +98,8 @@ def _normalize_stats(raw: Optional[Dict]) -> Dict:
             if key in raw and raw.get(key) is not None:
                 try:
                     return int(raw.get(key))
-                except (TypeError, ValueError):
-                    try:
-                        return int(float(raw.get(key)))
-                    except (TypeError, ValueError):
-                        continue
+                except:
+                    pass
         return 0
 
     yards_candidates = [
@@ -105,68 +117,71 @@ def _normalize_stats(raw: Optional[Dict]) -> Dict:
         "passingTDs",
         "totalTDs",
     ]
+
     return {
         "games_played": _first_present(["games", "gamesPlayed"]),
-        "snaps": _first_present(["snaps", "plays", "offensePlays", "offensivePlays"]),
-        "targets": _first_present(["targets", "receptions"],),
+        "snaps": _first_present(["snaps", "plays", "offensePlays"]),
+        "targets": _first_present(["targets", "receptions"]),
         "receptions": _first_present(["receptions", "catches"]),
         "yards": _first_present(yards_candidates),
         "tds": _first_present(td_candidates),
         "tackles": _first_present(["tackles", "soloTackles", "totalTackles"]),
         "pass_breakups": _first_present(["passBreakups", "passesDefended"]),
-        "ints": _first_present(["ints", "interceptions", "interceptionsThrown"]),
+        "ints": _first_present(["ints", "interceptions"]),
     }
 
 
-def _resolve_team(team_index: Dict[str, Dict], team_name: Optional[str], school_id: Optional[int]) -> Optional[str]:
-    if school_id is not None:
-        key = str(school_id).lower()
-        if key in team_index:
-            return team_index[key].get("id")
-    if team_name:
-        key = team_name.strip().lower()
-        if key in team_index:
-            return team_index[key].get("id")
-    return None
-
+# ---------------------------------------------------------
+# MAIN INGESTION USING ON3
+# ---------------------------------------------------------
 
 def ingest_transfers(year: int = 2024):
     supabase = get_supabase()
 
-    transfers = get_transfers(year)
+    # NEW: Pull directly from On3 portal wire
+    transfers = get_on3_transfers()
+
+    # CFBD still manages teams
     team_index = _upsert_teams()
     season_id = _ensure_season(year)
 
     processed = 0
-    for transfer in transfers:
-        first = transfer.get("first_name") or transfer.get("firstName") or ""
-        last = transfer.get("last_name") or transfer.get("lastName") or ""
-        full_name = f"{first} {last}".strip()
-        player_key_name = full_name.lower()
 
-        destination_team = transfer.get("destination") or transfer.get("to_team") or transfer.get("toSchool")
-        origin_team = transfer.get("origin") or transfer.get("from_team") or transfer.get("fromSchool")
-        destination_school_id = transfer.get("to_id") or transfer.get("toSchoolId")
-        origin_school_id = transfer.get("from_id") or transfer.get("fromSchoolId")
+    for t in transfers:
+        full_name = t.get("player_name") or ""
+        position = t.get("position")
+        class_year = t.get("class_year")
+        height = t.get("height")
+        weight = t.get("weight")
+        on3_team = t.get("on3_team")
+        entered_date = t.get("entered_date")
+        rating = t.get("rating")
 
-        dest_team_id = _resolve_team(team_index, destination_team, destination_school_id)
-        origin_team_id = _resolve_team(team_index, origin_team, origin_school_id)
-
+        # Player payload for Supabase
         player_payload = {
             "full_name": full_name,
-            "position": transfer.get("position"),
-            "height": transfer.get("height"),
-            "weight": transfer.get("weight"),
-            "class_year": transfer.get("classification") or transfer.get("class_year"),
-            "hometown": transfer.get("hometown"),
-            "prev_school": origin_team,
-            "cfbd_player_id": transfer.get("id") or transfer.get("player_id"),
-            "current_team_id": dest_team_id,
+            "position": position,
+            "height": height,
+            "weight": weight,
+            "class_year": class_year,
+            "prev_school": None,   # On3 doesn't expose this directly on wire
+            "cfbd_player_id": None,  # No CFBD ID for On3-only players
+            "current_team_id": None,  # resolved below
+            "rating": rating,
+            "portal_status": t.get("status"),
+            "entered_portal": entered_date,
         }
 
+        # Attempt to resolve the team if name matches
+        if on3_team:
+            key = on3_team.strip().lower()
+            if key in team_index:
+                player_payload["current_team_id"] = team_index[key]["id"]
+
+        # UPSERT PLAYER
         player_response = (
             supabase.table("players")
-            .upsert(player_payload, on_conflict="cfbd_player_id")
+            .upsert(player_payload, on_conflict="full_name")
             .execute()
         )
         player_rows = player_response.data or []
@@ -174,7 +189,7 @@ def ingest_transfers(year: int = 2024):
             player_rows = (
                 supabase.table("players")
                 .select("id")
-                .eq("cfbd_player_id", player_payload["cfbd_player_id"])
+                .eq("full_name", full_name)
                 .limit(1)
                 .execute()
                 .data
@@ -182,42 +197,45 @@ def ingest_transfers(year: int = 2024):
             )
         if not player_rows:
             continue
+
         player_id = player_rows[0]["id"]
 
-        team_for_stats = origin_team or destination_team
-        raw_stats_list = get_player_season_stats(year, team_for_stats) if team_for_stats else []
-        raw_player_stats = _find_player_stats(raw_stats_list, transfer, player_key_name)
-        stats_payload = _normalize_stats(raw_player_stats)
+        # -------- STATS (OPTIONAL / FALLBACK ONLY) --------
+        # We have no guaranteed team name for CFBD stats matching.
+        stats_payload = _normalize_stats(None)
 
         season_stats_payload = {
             "player_id": player_id,
-            "team_id": origin_team_id or dest_team_id,
+            "team_id": player_payload["current_team_id"],
             "season_id": season_id,
-            "games_played": stats_payload.get("games_played"),
-            "snaps": stats_payload.get("snaps"),
-            "targets": stats_payload.get("targets"),
-            "receptions": stats_payload.get("receptions"),
-            "yards": stats_payload.get("yards"),
-            "tds": stats_payload.get("tds"),
-            "tackles": stats_payload.get("tackles"),
-            "pass_breakups": stats_payload.get("pass_breakups"),
-            "ints": stats_payload.get("ints"),
-            "raw_source": raw_player_stats or {},
+            "games_played": stats_payload["games_played"],
+            "snaps": stats_payload["snaps"],
+            "targets": stats_payload["targets"],
+            "receptions": stats_payload["receptions"],
+            "yards": stats_payload["yards"],
+            "tds": stats_payload["tds"],
+            "tackles": stats_payload["tackles"],
+            "pass_breakups": stats_payload["pass_breakups"],
+            "ints": stats_payload["ints"],
+            "raw_source": {},
         }
 
         supabase.table("player_season_stats").upsert(
             season_stats_payload, on_conflict="player_id,season_id"
         ).execute()
 
+        # -------- TVI COMPUTATION --------
         tvi_record = compute_tvi(stats_payload, player_payload)
+
         tvi_payload = {
             "player_id": player_id,
-            "team_id": origin_team_id or dest_team_id,
+            "team_id": player_payload["current_team_id"],
             "season_id": season_id,
             "tvi": tvi_record["tvi"],
             "components": tvi_record["components"],
             "model_version": "v1",
         }
+
         supabase.table("tvi_scores").upsert(
             tvi_payload, on_conflict="player_id,season_id,model_version"
         ).execute()
