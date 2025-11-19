@@ -19,17 +19,22 @@ def _build_headers() -> Dict[str, str]:
     return {"Authorization": f"Bearer {api_key}"}
 
 
-def _get(path: str, params: Dict[str, Any] | None = None) -> List[Dict[str, Any]]:
-    url = f"{BASE_URL}{path}"
-    response = requests.get(url, headers=_build_headers(), params=params, timeout=30)
-    if response.status_code != 200:
-        raise RuntimeError(
-            f"CFBD request failed: {response.status_code} {response.text}"
-        )
-    data = response.json()
-    if not isinstance(data, list):
-        raise RuntimeError("Unexpected CFBD response format; expected a list")
-    return data
+def _get(endpoint, params=None):
+    url = BASE_URL + endpoint
+    headers = _build_headers()
+
+    response = requests.get(url, headers=headers, params=params, timeout=30)
+
+    # Debug: if not JSON, print details
+    try:
+        return response.json()
+    except Exception:
+        print("=== CFBD ERROR RESPONSE ===")
+        print("URL:", url)
+        print("Status:", response.status_code)
+        print("Text:", response.text)
+        print("===========================")
+        raise
 
 
 def get_transfers(year: int) -> List[Dict[str, Any]]:
